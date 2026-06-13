@@ -55,6 +55,17 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     // --- 2. Validate Inputs ---
     $errors = [];
 
+    // recipient_name
+    if ($rawName === '') {
+        $errors[] = 'Client name is required.';
+    } elseif (mb_strlen($rawName) < 2) {
+        $errors[] = 'Client name must be at least 2 characters.';
+    } elseif (mb_strlen($rawName) > 100) {
+        $errors[] = 'Client name must not exceed 100 characters.';
+    } elseif (preg_match('/[\/\\\:*?"<>|]/', $rawName)) {
+        $errors[] = 'Client name contains invalid characters.';
+    }
+
     // --- 3. Stop and display errors if validation failed ---
     if (!empty($errors)) {
         $errorItems = '';
