@@ -66,6 +66,15 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $errors[] = 'Client name contains invalid characters.';
     }
 
+    // recipient_email
+    if ($rawEmail === '') {
+        $errors[] = 'Email address is required.';
+    } elseif (mb_strlen($rawEmail) > 254) {
+        $errors[] = 'Email address must not exceed 254 characters.';
+    } elseif (!filter_var($rawEmail, FILTER_VALIDATE_EMAIL)) {
+        $errors[] = 'A valid email address is required.';
+    }
+
     // --- 3. Stop and display errors if validation failed ---
     if (!empty($errors)) {
         $errorItems = '';
