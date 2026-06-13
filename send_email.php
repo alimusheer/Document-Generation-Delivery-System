@@ -38,7 +38,21 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     unset($_SESSION['csrf_token']);
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 
-    // --- 1. Sanitize and Capture Form Data ---
+    // --- 1. Trim Raw Inputs ---
+    $rawName    = trim($_POST['recipient_name']  ?? '');
+    $rawEmail   = trim($_POST['recipient_email'] ?? '');
+    $rawIntro   = trim($_POST['intro_message']   ?? '');
+    $days       = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+    $rawPlan    = [];
+    foreach ($days as $day) {
+        $key = strtolower($day);
+        $rawPlan[$day] = [
+            'focus'   => trim($_POST[$key . '_focus']   ?? ''),
+            'details' => trim($_POST[$key . '_details'] ?? ''),
+        ];
+    }
+
+    // --- 2. Sanitize and Capture Form Data ---
     $recipientName = htmlspecialchars($_POST["recipient_name"]);
     $recipientEmail = filter_var($_POST["recipient_email"], FILTER_SANITIZE_EMAIL);
     $introMessage = nl2br(htmlspecialchars($_POST["intro_message"])); // Convert newlines to <br> for HTML
