@@ -75,6 +75,15 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $errors[] = 'A valid email address is required.';
     }
 
+    // intro_message
+    if ($rawIntro === '') {
+        $errors[] = 'Introductory message is required.';
+    } elseif (mb_strlen($rawIntro) < 10) {
+        $errors[] = 'Introductory message must be at least 10 characters.';
+    } elseif (mb_strlen($rawIntro) > 2000) {
+        $errors[] = 'Introductory message must not exceed 2000 characters.';
+    }
+
     // --- 3. Stop and display errors if validation failed ---
     if (!empty($errors)) {
         $errorItems = '';
