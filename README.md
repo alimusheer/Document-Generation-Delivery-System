@@ -54,7 +54,7 @@ While the current implementation uses a fitness plan template as a demonstration
 ### 1. Clone Repository
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Ali-Hassan-Mushir/Document-Generation-Delivery-System.git
 ```
 
 ### 2. Install Dependencies

@@ -1,4 +1,6 @@
 <?php
+session_start();
+
 // --- SETUP & AUTOLOADING ---
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\SMTP;
@@ -14,8 +16,24 @@ $dotenv->load();
 // This variable will hold the HTML for the success/error message
 $outputMessage = '';
 
+// Generate a CSRF token for this session if one does not exist
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
 // --- PROCESS THE FORM WHEN SUBMITTED ---
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
+
+    // --- CSRF Validation ---
+    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+        http_response_code(403);
+        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Security Validation Failed</h2>
+                          <p style='color: #FF6B6B; text-align: center;'>Your request could not be verified. Please refresh the page and try again.</p>";
+    } else {
+
+    // Consume the used token and immediately issue a fresh one
+    unset($_SESSION['csrf_token']);
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 
     // --- 1. Sanitize and Capture Form Data ---
     $recipientName = htmlspecialchars($_POST["recipient_name"]);
@@ -127,6 +145,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             unlink($pdfFileName);
         }
     }
+
+    } // end CSRF-valid block
 }
 ?>
 <!DOCTYPE html>
@@ -166,13 +186,14 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             <h2>ELITE PLAN CREATOR</h2>
             <p class="subtitle">For Premium Clients</p>
         </div>
-        
+
         <?php if (!empty($outputMessage)): ?>
             <div class="result-container">
                 <?php echo $outputMessage; ?>
             </div>
         <?php else: ?>
             <form action="<?php echo htmlspecialchars($_SERVER["PHP_SELF"]); ?>" method="post">
+                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                 <div class="section-title">Client Details</div>
                 <div class="form-section grid-2">
                     <div>
