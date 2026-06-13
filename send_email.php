@@ -94,6 +94,18 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         }
     }
 
+    // Business rule: at least one day must have a focus or details entry
+    $hasAnyPlan = false;
+    foreach ($days as $day) {
+        if ($rawPlan[$day]['focus'] !== '' || $rawPlan[$day]['details'] !== '') {
+            $hasAnyPlan = true;
+            break;
+        }
+    }
+    if (!$hasAnyPlan) {
+        $errors[] = 'At least one day must have a workout focus or details.';
+    }
+
     // --- 3. Stop and display errors if validation failed ---
     if (!empty($errors)) {
         $errorItems = '';
