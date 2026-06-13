@@ -38,7 +38,85 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     unset($_SESSION['csrf_token']);
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 
-    // --- 1. Sanitize and Capture Form Data ---
+    // --- 1. Trim Raw Inputs ---
+    $rawName    = trim($_POST['recipient_name']  ?? '');
+    $rawEmail   = trim($_POST['recipient_email'] ?? '');
+    $rawIntro   = trim($_POST['intro_message']   ?? '');
+    $days       = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+    $rawPlan    = [];
+    foreach ($days as $day) {
+        $key = strtolower($day);
+        $rawPlan[$day] = [
+            'focus'   => trim($_POST[$key . '_focus']   ?? ''),
+            'details' => trim($_POST[$key . '_details'] ?? ''),
+        ];
+    }
+
+    // --- 2. Validate Inputs ---
+    $errors = [];
+
+    // recipient_name
+    if ($rawName === '') {
+        $errors[] = 'Client name is required.';
+    } elseif (mb_strlen($rawName) < 2) {
+        $errors[] = 'Client name must be at least 2 characters.';
+    } elseif (mb_strlen($rawName) > 100) {
+        $errors[] = 'Client name must not exceed 100 characters.';
+    } elseif (preg_match('/[\/\\\:*?"<>|]/', $rawName)) {
+        $errors[] = 'Client name contains invalid characters.';
+    }
+
+    // recipient_email
+    if ($rawEmail === '') {
+        $errors[] = 'Email address is required.';
+    } elseif (mb_strlen($rawEmail) > 254) {
+        $errors[] = 'Email address must not exceed 254 characters.';
+    } elseif (!filter_var($rawEmail, FILTER_VALIDATE_EMAIL)) {
+        $errors[] = 'A valid email address is required.';
+    }
+
+    // intro_message
+    if ($rawIntro === '') {
+        $errors[] = 'Introductory message is required.';
+    } elseif (mb_strlen($rawIntro) < 10) {
+        $errors[] = 'Introductory message must be at least 10 characters.';
+    } elseif (mb_strlen($rawIntro) > 2000) {
+        $errors[] = 'Introductory message must not exceed 2000 characters.';
+    }
+
+    // day_focus and day_details (optional, length limits only)
+    foreach ($days as $day) {
+        if (mb_strlen($rawPlan[$day]['focus']) > 150) {
+            $errors[] = $day . ' workout focus must not exceed 150 characters.';
+        }
+        if (mb_strlen($rawPlan[$day]['details']) > 500) {
+            $errors[] = $day . ' details must not exceed 500 characters.';
+        }
+    }
+
+    // Business rule: at least one day must have a focus or details entry
+    $hasAnyPlan = false;
+    foreach ($days as $day) {
+        if ($rawPlan[$day]['focus'] !== '' || $rawPlan[$day]['details'] !== '') {
+            $hasAnyPlan = true;
+            break;
+        }
+    }
+    if (!$hasAnyPlan) {
+        $errors[] = 'At least one day must have a workout focus or details.';
+    }
+
+    // --- 3. Stop and display errors if validation failed ---
+    if (!empty($errors)) {
+        $errorItems = '';
+        foreach ($errors as $error) {
+            $errorItems .= "<li>" . htmlspecialchars($error) . "</li>";
+        }
+        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Please correct the following errors:</h2>
+                          <ul style='color: #FF6B6B; margin-top: 12px; padding-left: 20px; line-height: 2;'>{$errorItems}</ul>";
+    } else {
+
+    // --- 4. Sanitize and Capture Form Data ---
     $recipientName = htmlspecialchars($_POST["recipient_name"]);
     $recipientEmail = filter_var($_POST["recipient_email"], FILTER_SANITIZE_EMAIL);
     $introMessage = nl2br(htmlspecialchars($_POST["intro_message"])); // Convert newlines to <br> for HTML
@@ -148,6 +226,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             unlink($pdfFileName);
         }
     }
+
+    } // end validation-passed block
 
     } // end CSRF-valid block
 }
