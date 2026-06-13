@@ -84,6 +84,16 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $errors[] = 'Introductory message must not exceed 2000 characters.';
     }
 
+    // day_focus and day_details (optional, length limits only)
+    foreach ($days as $day) {
+        if (mb_strlen($rawPlan[$day]['focus']) > 150) {
+            $errors[] = $day . ' workout focus must not exceed 150 characters.';
+        }
+        if (mb_strlen($rawPlan[$day]['details']) > 500) {
+            $errors[] = $day . ' details must not exceed 500 characters.';
+        }
+    }
+
     // --- 3. Stop and display errors if validation failed ---
     if (!empty($errors)) {
         $errorItems = '';
