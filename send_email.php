@@ -52,7 +52,20 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         ];
     }
 
-    // --- 2. Sanitize and Capture Form Data ---
+    // --- 2. Validate Inputs ---
+    $errors = [];
+
+    // --- 3. Stop and display errors if validation failed ---
+    if (!empty($errors)) {
+        $errorItems = '';
+        foreach ($errors as $error) {
+            $errorItems .= "<li>" . htmlspecialchars($error) . "</li>";
+        }
+        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Please correct the following errors:</h2>
+                          <ul style='color: #FF6B6B; margin-top: 12px; padding-left: 20px; line-height: 2;'>{$errorItems}</ul>";
+    } else {
+
+    // --- 4. Sanitize and Capture Form Data ---
     $recipientName = htmlspecialchars($_POST["recipient_name"]);
     $recipientEmail = filter_var($_POST["recipient_email"], FILTER_SANITIZE_EMAIL);
     $introMessage = nl2br(htmlspecialchars($_POST["intro_message"])); // Convert newlines to <br> for HTML
@@ -162,6 +175,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             unlink($pdfFileName);
         }
     }
+
+    } // end validation-passed block
 
     } // end CSRF-valid block
 }
