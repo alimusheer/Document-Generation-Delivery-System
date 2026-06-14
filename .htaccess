@@ -1,0 +1,11 @@
+Options -Indexes
+DirectoryIndex send_email.php
+
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ send_email.php [L]
+
+<FilesMatch "\.(log)$">
+    Require all denied
+</FilesMatch>

@@ -12,6 +12,20 @@ use PHPMailer\PHPMailer\Exception;
 // Load Composer's autoloader for PHPMailer and mPDF
 require 'vendor/autoload.php';
 
+// --- LOGGING HELPER ---
+function write_log(string $context, string $message): void {
+    $logDir  = __DIR__ . '/logs';
+    $logFile = $logDir . '/app.log';
+    if (!is_dir($logDir)) {
+        mkdir($logDir, 0755, true);
+    }
+    if (file_exists($logFile) && filesize($logFile) > 1048576) {
+        rename($logFile, $logDir . '/app.log.bak');
+    }
+    $entry = '[' . date('Y-m-d H:i:s') . '] [ERROR] [' . $context . '] ' . $message . PHP_EOL;
+    file_put_contents($logFile, $entry, FILE_APPEND | LOCK_EX);
+}
+
 // This variable will hold the HTML for the success/error message
 $outputMessage = '';
 
@@ -21,6 +35,7 @@ try {
     $dotenv->load();
     $dotenv->required(['MAIL_HOST', 'MAIL_USERNAME', 'MAIL_PASSWORD', 'MAIL_PORT', 'MAIL_ENCRYPTION', 'MAIL_FROM_ADDRESS', 'MAIL_FROM_NAME']);
 } catch (\Dotenv\Exception\InvalidPathException | \Dotenv\Exception\ValidationException $e) {
+    write_log('CONFIG', $e->getMessage());
     $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Application Configuration Error</h2>
                       <p style='color: #FF6B6B; text-align: center;'>The application is not configured correctly. Please contact the administrator.</p>";
 }
@@ -196,6 +211,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $mpdf->Output($pdfFileName, 'F'); // 'F' saves the file to the server
         $pdfGenerated = true;
     } catch (\Throwable $e) {
+        write_log('PDF', get_class($e) . ': ' . $e->getMessage() . ' in ' . basename($e->getFile()) . ':' . $e->getLine());
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>PDF Generation Failed</h2>
                           <p style='color: #FF6B6B; text-align: center;'>Your plan could not be generated at this time. Please try again later.</p>";
         if (file_exists($pdfFileName)) {
@@ -235,12 +251,16 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                           <p style='color: #90EE90; text-align: center;'>The personalized PDF plan has been generated and sent to {$recipientEmail}.</p>";
 
     } catch (Exception $e) {
+        write_log('MAIL', $e->getMessage() . ' | ErrorInfo: ' . $mail->ErrorInfo);
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Email Could Not Be Sent</h2>
                           <p style='color: #FF6B6B; text-align: center;'>Your plan could not be delivered at this time. Please try again later.</p>";
     } finally {
         // Delete the temporary PDF file from the server
         if (file_exists($pdfFileName)) {
             $deleted = unlink($pdfFileName);
+            if ($deleted === false) {
+                write_log('CLEANUP', 'Failed to delete temporary PDF: ' . basename($pdfFileName));
+            }
         }
     }
 
