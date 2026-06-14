@@ -203,19 +203,20 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     </html>";
     
     // --- 3. Generate PDF using mPDF ---
-    $pdfFileName = "Elite_Fitness_Plan_" . str_replace(' ', '_', $recipientName) . ".pdf";
+    $pdfMailName = 'Elite_Fitness_Plan_' . str_replace(' ', '_', $recipientName) . '.pdf';
+    $pdfTmpPath  = __DIR__ . '/tmp/' . bin2hex(random_bytes(8)) . '.pdf';
     $pdfGenerated = false;
     try {
         $mpdf = new \Mpdf\Mpdf(['tempDir' => __DIR__ . '/tmp']);
         $mpdf->WriteHTML($htmlForPdf);
-        $mpdf->Output($pdfFileName, 'F'); // 'F' saves the file to the server
+        $mpdf->Output($pdfTmpPath, 'F'); // 'F' saves the file to the server
         $pdfGenerated = true;
     } catch (\Throwable $e) {
         write_log('PDF', get_class($e) . ': ' . $e->getMessage() . ' in ' . basename($e->getFile()) . ':' . $e->getLine());
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>PDF Generation Failed</h2>
                           <p style='color: #FF6B6B; text-align: center;'>Your plan could not be generated at this time. Please try again later.</p>";
-        if (file_exists($pdfFileName)) {
-            unlink($pdfFileName);
+        if (file_exists($pdfTmpPath)) {
+            unlink($pdfTmpPath);
         }
     }
 
@@ -243,7 +244,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $mail->Body    = "Hello {$recipientName},<br><br>Your personalized fitness plan is ready. Please find the attached PDF, which contains your full weekly schedule.<br><br>We are excited to be part of your fitness journey.<br><br>To your health,<br>The Elite Fitness Team";
         
         // Attach the generated PDF
-        $mail->addAttachment($pdfFileName);
+        $mail->addAttachment($pdfTmpPath, $pdfMailName);
 
         $mail->send();
         
@@ -256,10 +257,10 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                           <p style='color: #FF6B6B; text-align: center;'>Your plan could not be delivered at this time. Please try again later.</p>";
     } finally {
         // Delete the temporary PDF file from the server
-        if (file_exists($pdfFileName)) {
-            $deleted = unlink($pdfFileName);
+        if (file_exists($pdfTmpPath)) {
+            $deleted = unlink($pdfTmpPath);
             if ($deleted === false) {
-                write_log('CLEANUP', 'Failed to delete temporary PDF: ' . basename($pdfFileName));
+                write_log('CLEANUP', 'Failed to delete temporary PDF: ' . basename($pdfTmpPath));
             }
         }
     }
