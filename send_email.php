@@ -1,7 +1,27 @@
 <?php
+// --- HTTPS DETECTION ---
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')
+        || (isset($_SERVER['SERVER_PORT']) && (int) $_SERVER['SERVER_PORT'] === 443);
+
+// --- SECURITY HEADERS ---
+// NOTE: Content-Security-Policy must be updated in Issue #8 (Cloudflare Turnstile).
+// When Turnstile is added: script-src and frame-src must include https://challenges.cloudflare.com
+header('X-Frame-Options: DENY');
+header('X-Content-Type-Options: nosniff');
+header('Referrer-Policy: strict-origin-when-cross-origin');
+header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
+header("Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'");
+if ($isHttps) {
+    header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+}
+
+// --- SESSION ---
 session_start([
     'cookie_httponly' => true,
-    'cookie_samesite' => 'Lax'
+    'cookie_samesite' => 'Lax',
+    'cookie_secure'   => $isHttps,
+    'use_strict_mode' => true,
 ]);
 
 // --- SETUP & AUTOLOADING ---
