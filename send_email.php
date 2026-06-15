@@ -24,6 +24,10 @@ session_start([
     'use_strict_mode' => true,
 ]);
 
+define('RATE_LIMIT_PER_MINUTE', 5);
+define('RATE_LIMIT_PER_HOUR', 20);
+define('RATE_LIMIT_FILE', __DIR__ . '/tmp/rate_limits.json');
+
 // --- SETUP & AUTOLOADING ---
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\SMTP;
@@ -44,6 +48,150 @@ function write_log(string $context, string $message): void {
     }
     $entry = '[' . date('Y-m-d H:i:s') . '] [ERROR] [' . $context . '] ' . $message . PHP_EOL;
     file_put_contents($logFile, $entry, FILE_APPEND | LOCK_EX);
+}
+
+function get_client_ip_address(): string {
+    return $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+}
+
+function enforce_rate_limit(string $clientIp): array {
+    $allowResult = [
+        'allowed' => true,
+        'triggered_limit' => null,
+        'retry_after' => 0,
+    ];
+
+    $storageDir = dirname(RATE_LIMIT_FILE);
+    if (!is_dir($storageDir) && !mkdir($storageDir, 0755, true) && !is_dir($storageDir)) {
+        write_log('RATE_LIMIT_ERROR', 'Storage directory unavailable: ' . $storageDir . ' | IP: ' . $clientIp);
+        return $allowResult;
+    }
+
+    $handle = @fopen(RATE_LIMIT_FILE, 'c+');
+    if ($handle === false) {
+        write_log('RATE_LIMIT_ERROR', 'Unable to open rate limit file: ' . RATE_LIMIT_FILE . ' | IP: ' . $clientIp);
+        return $allowResult;
+    }
+
+    if (!flock($handle, LOCK_EX)) {
+        fclose($handle);
+        write_log('RATE_LIMIT_ERROR', 'Unable to acquire lock for rate limit file | IP: ' . $clientIp);
+        return $allowResult;
+    }
+
+    try {
+        rewind($handle);
+        $rawJson = stream_get_contents($handle);
+        if ($rawJson === false) {
+            write_log('RATE_LIMIT_ERROR', 'Unable to read rate limit file | IP: ' . $clientIp);
+            return $allowResult;
+        }
+
+        $rateData = [];
+        if (trim($rawJson) !== '') {
+            $decoded = json_decode($rawJson, true);
+            if (is_array($decoded)) {
+                $rateData = $decoded;
+            } else {
+                write_log('RATE_LIMIT_ERROR', 'Invalid JSON in rate limit file. Resetting structure.');
+            }
+        }
+
+        $now = time();
+        $minuteCutoff = $now - 60;
+        $hourCutoff = $now - 3600;
+
+        foreach ($rateData as $ip => $entry) {
+            if (!is_array($entry)) {
+                unset($rateData[$ip]);
+                continue;
+            }
+
+            $minuteEntries = $entry['minute'] ?? [];
+            $hourEntries = $entry['hour'] ?? [];
+
+            if (!is_array($minuteEntries)) {
+                $minuteEntries = [];
+            }
+            if (!is_array($hourEntries)) {
+                $hourEntries = [];
+            }
+
+            $minuteEntries = array_values(array_filter($minuteEntries, static function ($timestamp) use ($minuteCutoff): bool {
+                return is_numeric($timestamp) && (int) $timestamp >= $minuteCutoff;
+            }));
+            $hourEntries = array_values(array_filter($hourEntries, static function ($timestamp) use ($hourCutoff): bool {
+                return is_numeric($timestamp) && (int) $timestamp >= $hourCutoff;
+            }));
+
+            $minuteEntries = array_map('intval', $minuteEntries);
+            $hourEntries = array_map('intval', $hourEntries);
+
+            if ($minuteEntries === [] && $hourEntries === []) {
+                unset($rateData[$ip]);
+                continue;
+            }
+
+            $rateData[$ip] = [
+                'minute' => $minuteEntries,
+                'hour' => $hourEntries,
+            ];
+        }
+
+        if (!isset($rateData[$clientIp])) {
+            $rateData[$clientIp] = [
+                'minute' => [],
+                'hour' => [],
+            ];
+        }
+
+        $currentMinute = $rateData[$clientIp]['minute'];
+        $currentHour = $rateData[$clientIp]['hour'];
+
+        $isBlocked = false;
+        $triggeredLimit = null;
+        $retryAfter = 0;
+
+        if (count($currentMinute) >= RATE_LIMIT_PER_MINUTE) {
+            $isBlocked = true;
+            $triggeredLimit = 'minute';
+            $retryAfter = 60;
+        } elseif (count($currentHour) >= RATE_LIMIT_PER_HOUR) {
+            $isBlocked = true;
+            $triggeredLimit = 'hour';
+            $retryAfter = 3600;
+        } else {
+            $rateData[$clientIp]['minute'][] = $now;
+            $rateData[$clientIp]['hour'][] = $now;
+        }
+
+        $encoded = json_encode($rateData, JSON_UNESCAPED_SLASHES);
+        if ($encoded === false) {
+            write_log('RATE_LIMIT_ERROR', 'Unable to encode rate limit JSON | IP: ' . $clientIp);
+            return $allowResult;
+        }
+
+        rewind($handle);
+        if (!ftruncate($handle, 0)) {
+            write_log('RATE_LIMIT_ERROR', 'Unable to truncate rate limit file | IP: ' . $clientIp);
+            return $allowResult;
+        }
+
+        if (fwrite($handle, $encoded) === false) {
+            write_log('RATE_LIMIT_ERROR', 'Unable to write rate limit file | IP: ' . $clientIp);
+            return $allowResult;
+        }
+        fflush($handle);
+
+        return [
+            'allowed' => !$isBlocked,
+            'triggered_limit' => $triggeredLimit,
+            'retry_after' => $retryAfter,
+        ];
+    } finally {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+    }
 }
 
 // This variable will hold the HTML for the success/error message
@@ -78,6 +226,23 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     // Consume the used token and immediately issue a fresh one
     unset($_SESSION['csrf_token']);
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+
+    $clientIp = get_client_ip_address();
+    $rateLimit = enforce_rate_limit($clientIp);
+    if (!$rateLimit['allowed']) {
+        http_response_code(429);
+        header('Retry-After: ' . (string) $rateLimit['retry_after']);
+        write_log(
+            'RATE_LIMIT',
+            'Blocked request | IP: ' . $clientIp
+            . ' | limit: ' . $rateLimit['triggered_limit']
+            . ' | timestamp: ' . date('Y-m-d H:i:s')
+            . ' | session_id: ' . session_id()
+        );
+
+        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Too Many Requests</h2>
+                          <p style='color: #FF6B6B; text-align: center;'>You have submitted too many requests. Please wait and try again.</p>";
+    } else {
 
     // --- 1. Trim Raw Inputs ---
     $rawName    = trim($_POST['recipient_name']  ?? '');
@@ -286,6 +451,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     }
 
     endif; // end pdfGenerated block
+
+    } // end rate-limit-allowed block
 
     } // end validation-passed block
 
