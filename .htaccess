@@ -1,11 +1,30 @@
 Options -Indexes
 DirectoryIndex send_email.php
 
-RewriteEngine On
-RewriteCond %{REQUEST_FILENAME} !-f
-RewriteCond %{REQUEST_FILENAME} !-d
-RewriteRule ^ send_email.php [L]
-
+# --- SECURITY: deny direct access to sensitive files ---
 <FilesMatch "\.(log)$">
     Require all denied
 </FilesMatch>
+
+# Block direct access to JSON runtime files (rate limits, SMTP quotas)
+<FilesMatch "\.json$">
+    Require all denied
+</FilesMatch>
+
+# Block direct access to environment files
+<FilesMatch "^\.env(\.example)?$">
+    Require all denied
+</FilesMatch>
+
+RewriteEngine On
+
+# --- SECURITY: block sensitive directories BEFORE the catch-all rewrite ---
+# These must precede the front-controller rule; otherwise the catch-all [L]
+# would route non-existent tmp//Docs/ paths to the app instead of denying them.
+RewriteRule ^tmp(/|$) - [F,L]
+RewriteRule ^Docs(/|$) - [F,L]
+
+# Front-controller catch-all (runs only after the security deny rules above)
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ send_email.php [L]

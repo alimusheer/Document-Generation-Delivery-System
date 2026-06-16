@@ -1,8 +1,37 @@
 <?php
+// --- HTTPS DETECTION ---
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')
+        || (isset($_SERVER['SERVER_PORT']) && (int) $_SERVER['SERVER_PORT'] === 443);
+
+// --- SECURITY HEADERS ---
+// NOTE: Content-Security-Policy must be updated in Issue #8 (Cloudflare Turnstile).
+// When Turnstile is added: script-src and frame-src must include https://challenges.cloudflare.com
+header('X-Frame-Options: DENY');
+header('X-Content-Type-Options: nosniff');
+header('Referrer-Policy: strict-origin-when-cross-origin');
+header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
+header("Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'");
+if ($isHttps) {
+    header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+}
+
+// --- SESSION ---
 session_start([
     'cookie_httponly' => true,
-    'cookie_samesite' => 'Lax'
+    'cookie_samesite' => 'Lax',
+    'cookie_secure'   => $isHttps,
+    'use_strict_mode' => true,
 ]);
+
+define('RATE_LIMIT_PER_MINUTE', 5);
+define('RATE_LIMIT_PER_HOUR', 20);
+define('RATE_LIMIT_FILE', __DIR__ . '/tmp/rate_limits.json');
+
+define('SMTP_QUOTA_GLOBAL_PER_DAY', 100);
+define('SMTP_QUOTA_PER_IP_PER_DAY', 10);
+define('SMTP_QUOTA_WINDOW_SECONDS', 86400);
+define('SMTP_QUOTA_FILE', __DIR__ . '/tmp/smtp_quotas.json');
 
 // --- SETUP & AUTOLOADING ---
 use PHPMailer\PHPMailer\PHPMailer;
@@ -24,6 +53,354 @@ function write_log(string $context, string $message): void {
     }
     $entry = '[' . date('Y-m-d H:i:s') . '] [ERROR] [' . $context . '] ' . $message . PHP_EOL;
     file_put_contents($logFile, $entry, FILE_APPEND | LOCK_EX);
+}
+
+function get_client_ip_address(): string {
+    return $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+}
+
+function enforce_rate_limit(string $clientIp): array {
+    $allowResult = [
+        'allowed' => true,
+        'triggered_limit' => null,
+        'retry_after' => 0,
+    ];
+
+    $storageDir = dirname(RATE_LIMIT_FILE);
+    if (!is_dir($storageDir) && !mkdir($storageDir, 0755, true) && !is_dir($storageDir)) {
+        write_log('RATE_LIMIT_ERROR', 'Storage directory unavailable: ' . $storageDir . ' | IP: ' . $clientIp);
+        return $allowResult;
+    }
+
+    $handle = @fopen(RATE_LIMIT_FILE, 'c+');
+    if ($handle === false) {
+        write_log('RATE_LIMIT_ERROR', 'Unable to open rate limit file: ' . RATE_LIMIT_FILE . ' | IP: ' . $clientIp);
+        return $allowResult;
+    }
+
+    if (!flock($handle, LOCK_EX)) {
+        fclose($handle);
+        write_log('RATE_LIMIT_ERROR', 'Unable to acquire lock for rate limit file | IP: ' . $clientIp);
+        return $allowResult;
+    }
+
+    try {
+        rewind($handle);
+        $rawJson = stream_get_contents($handle);
+        if ($rawJson === false) {
+            write_log('RATE_LIMIT_ERROR', 'Unable to read rate limit file | IP: ' . $clientIp);
+            return $allowResult;
+        }
+
+        $rateData = [];
+        if (trim($rawJson) !== '') {
+            $decoded = json_decode($rawJson, true);
+            if (is_array($decoded)) {
+                $rateData = $decoded;
+            } else {
+                write_log('RATE_LIMIT_ERROR', 'Invalid JSON in rate limit file. Resetting structure.');
+            }
+        }
+
+        $now = time();
+        $minuteCutoff = $now - 60;
+        $hourCutoff = $now - 3600;
+
+        foreach ($rateData as $ip => $entry) {
+            if (!is_array($entry)) {
+                unset($rateData[$ip]);
+                continue;
+            }
+
+            $minuteEntries = $entry['minute'] ?? [];
+            $hourEntries = $entry['hour'] ?? [];
+
+            if (!is_array($minuteEntries)) {
+                $minuteEntries = [];
+            }
+            if (!is_array($hourEntries)) {
+                $hourEntries = [];
+            }
+
+            $minuteEntries = array_values(array_filter($minuteEntries, static function ($timestamp) use ($minuteCutoff): bool {
+                return is_numeric($timestamp) && (int) $timestamp >= $minuteCutoff;
+            }));
+            $hourEntries = array_values(array_filter($hourEntries, static function ($timestamp) use ($hourCutoff): bool {
+                return is_numeric($timestamp) && (int) $timestamp >= $hourCutoff;
+            }));
+
+            $minuteEntries = array_map('intval', $minuteEntries);
+            $hourEntries = array_map('intval', $hourEntries);
+
+            if ($minuteEntries === [] && $hourEntries === []) {
+                unset($rateData[$ip]);
+                continue;
+            }
+
+            $rateData[$ip] = [
+                'minute' => $minuteEntries,
+                'hour' => $hourEntries,
+            ];
+        }
+
+        if (!isset($rateData[$clientIp])) {
+            $rateData[$clientIp] = [
+                'minute' => [],
+                'hour' => [],
+            ];
+        }
+
+        $currentMinute = $rateData[$clientIp]['minute'];
+        $currentHour = $rateData[$clientIp]['hour'];
+
+        $isBlocked = false;
+        $triggeredLimit = null;
+        $retryAfter = 0;
+
+        if (count($currentMinute) >= RATE_LIMIT_PER_MINUTE) {
+            $isBlocked = true;
+            $triggeredLimit = 'minute';
+            $retryAfter = 60;
+        } elseif (count($currentHour) >= RATE_LIMIT_PER_HOUR) {
+            $isBlocked = true;
+            $triggeredLimit = 'hour';
+            $retryAfter = 3600;
+        } else {
+            $rateData[$clientIp]['minute'][] = $now;
+            $rateData[$clientIp]['hour'][] = $now;
+        }
+
+        $encoded = json_encode($rateData, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+        if ($encoded === false) {
+            write_log('RATE_LIMIT_ERROR', 'Unable to encode rate limit JSON | IP: ' . $clientIp);
+            return $allowResult;
+        }
+
+        rewind($handle);
+        if (!ftruncate($handle, 0)) {
+            write_log('RATE_LIMIT_ERROR', 'Unable to truncate rate limit file | IP: ' . $clientIp);
+            return $allowResult;
+        }
+
+        if (fwrite($handle, $encoded) === false) {
+            write_log('RATE_LIMIT_ERROR', 'Unable to write rate limit file | IP: ' . $clientIp);
+            return $allowResult;
+        }
+        fflush($handle);
+
+        return [
+            'allowed' => !$isBlocked,
+            'triggered_limit' => $triggeredLimit,
+            'retry_after' => $retryAfter,
+        ];
+    } finally {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+    }
+}
+
+function check_smtp_quota(string $ip): array {
+    // Fail-closed default: any storage failure blocks sending to protect SMTP reputation.
+    $blockResult = [
+        'allowed' => false,
+        'quota_type' => 'error',
+        'retry_after' => SMTP_QUOTA_WINDOW_SECONDS,
+    ];
+
+    $storageDir = dirname(SMTP_QUOTA_FILE);
+    if (!is_dir($storageDir) && !mkdir($storageDir, 0755, true) && !is_dir($storageDir)) {
+        write_log('SMTP_QUOTA_ERROR', 'Storage directory unavailable: ' . $storageDir . ' | IP: ' . $ip);
+        return $blockResult;
+    }
+
+    $handle = @fopen(SMTP_QUOTA_FILE, 'c+');
+    if ($handle === false) {
+        write_log('SMTP_QUOTA_ERROR', 'Unable to open quota file: ' . SMTP_QUOTA_FILE . ' | IP: ' . $ip);
+        return $blockResult;
+    }
+
+    if (!flock($handle, LOCK_EX)) {
+        fclose($handle);
+        write_log('SMTP_QUOTA_ERROR', 'Unable to acquire lock for quota file | IP: ' . $ip);
+        return $blockResult;
+    }
+
+    try {
+        rewind($handle);
+        $rawJson = stream_get_contents($handle);
+        if ($rawJson === false) {
+            write_log('SMTP_QUOTA_ERROR', 'Unable to read quota file | IP: ' . $ip);
+            return $blockResult;
+        }
+
+        $globalEntries = [];
+        $perIpEntries = [];
+        if (trim($rawJson) !== '') {
+            $decoded = json_decode($rawJson, true);
+            if (!is_array($decoded)) {
+                write_log('SMTP_QUOTA_ERROR', 'Invalid JSON in quota file. Blocking send (fail-closed) | IP: ' . $ip);
+                return $blockResult;
+            }
+            $globalEntries = $decoded['global'] ?? [];
+            $perIpEntries = $decoded['per_ip'] ?? [];
+            if (!is_array($globalEntries) || !is_array($perIpEntries)) {
+                write_log('SMTP_QUOTA_ERROR', 'Invalid quota structure. Blocking send (fail-closed) | IP: ' . $ip);
+                return $blockResult;
+            }
+        }
+
+        $now = time();
+        $cutoff = $now - SMTP_QUOTA_WINDOW_SECONDS;
+
+        // Prune expired entries and persist the cleaned structure while the lock is held.
+        $cleanGlobal = array_map('intval', array_values(array_filter($globalEntries, static function ($timestamp) use ($cutoff): bool {
+            return is_numeric($timestamp) && (int) $timestamp >= $cutoff;
+        })));
+
+        $cleanPerIp = [];
+        foreach ($perIpEntries as $existingIp => $timestamps) {
+            if (!is_array($timestamps)) {
+                continue;
+            }
+            $filtered = array_values(array_filter($timestamps, static function ($timestamp) use ($cutoff): bool {
+                return is_numeric($timestamp) && (int) $timestamp >= $cutoff;
+            }));
+            if ($filtered === []) {
+                continue;
+            }
+            $cleanPerIp[$existingIp] = array_map('intval', $filtered);
+        }
+
+        $cleanedData = ['global' => $cleanGlobal, 'per_ip' => $cleanPerIp];
+        $encoded = json_encode($cleanedData, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+        if ($encoded === false) {
+            write_log('SMTP_QUOTA_ERROR', 'Unable to encode pruned quota JSON. Blocking send (fail-closed) | IP: ' . $ip);
+            return $blockResult;
+        }
+
+        rewind($handle);
+        if (!ftruncate($handle, 0)) {
+            write_log('SMTP_QUOTA_ERROR', 'Unable to truncate quota file during prune. Blocking send (fail-closed) | IP: ' . $ip);
+            return $blockResult;
+        }
+        if (fwrite($handle, $encoded) === false) {
+            write_log('SMTP_QUOTA_ERROR', 'Unable to write pruned quota file. Blocking send (fail-closed) | IP: ' . $ip);
+            return $blockResult;
+        }
+        fflush($handle);
+
+        // Continue quota evaluation using the cleaned data.
+        $globalCount = count($cleanGlobal);
+        $perIpCount = isset($cleanPerIp[$ip]) ? count($cleanPerIp[$ip]) : 0;
+
+        if ($globalCount >= SMTP_QUOTA_GLOBAL_PER_DAY) {
+            return ['allowed' => false, 'quota_type' => 'global', 'retry_after' => SMTP_QUOTA_WINDOW_SECONDS];
+        }
+        if ($perIpCount >= SMTP_QUOTA_PER_IP_PER_DAY) {
+            return ['allowed' => false, 'quota_type' => 'per_ip', 'retry_after' => SMTP_QUOTA_WINDOW_SECONDS];
+        }
+
+        return ['allowed' => true, 'quota_type' => null, 'retry_after' => 0];
+    } finally {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+    }
+}
+
+function record_smtp_success(string $ip): bool {
+    $storageDir = dirname(SMTP_QUOTA_FILE);
+    if (!is_dir($storageDir) && !mkdir($storageDir, 0755, true) && !is_dir($storageDir)) {
+        write_log('SMTP_QUOTA_ERROR', 'Storage directory unavailable during record: ' . $storageDir . ' | IP: ' . $ip);
+        return false;
+    }
+
+    $handle = @fopen(SMTP_QUOTA_FILE, 'c+');
+    if ($handle === false) {
+        write_log('SMTP_QUOTA_ERROR', 'Unable to open quota file during record | IP: ' . $ip);
+        return false;
+    }
+
+    if (!flock($handle, LOCK_EX)) {
+        fclose($handle);
+        write_log('SMTP_QUOTA_ERROR', 'Unable to acquire lock during record | IP: ' . $ip);
+        return false;
+    }
+
+    try {
+        rewind($handle);
+        $rawJson = stream_get_contents($handle);
+        if ($rawJson === false) {
+            write_log('SMTP_QUOTA_ERROR', 'Unable to read quota file during record | IP: ' . $ip);
+            return false;
+        }
+
+        $quotaData = ['global' => [], 'per_ip' => []];
+        if (trim($rawJson) !== '') {
+            $decoded = json_decode($rawJson, true);
+            if (is_array($decoded)) {
+                $globalEntries = $decoded['global'] ?? [];
+                $perIpEntries = $decoded['per_ip'] ?? [];
+                if (is_array($globalEntries)) {
+                    $quotaData['global'] = $globalEntries;
+                }
+                if (is_array($perIpEntries)) {
+                    $quotaData['per_ip'] = $perIpEntries;
+                }
+            } else {
+                write_log('SMTP_QUOTA_ERROR', 'Invalid JSON during record. Resetting quota structure | IP: ' . $ip);
+            }
+        }
+
+        $now = time();
+        $cutoff = $now - SMTP_QUOTA_WINDOW_SECONDS;
+
+        $quotaData['global'] = array_map('intval', array_values(array_filter($quotaData['global'], static function ($timestamp) use ($cutoff): bool {
+            return is_numeric($timestamp) && (int) $timestamp >= $cutoff;
+        })));
+
+        foreach ($quotaData['per_ip'] as $existingIp => $timestamps) {
+            if (!is_array($timestamps)) {
+                unset($quotaData['per_ip'][$existingIp]);
+                continue;
+            }
+            $filtered = array_values(array_filter($timestamps, static function ($timestamp) use ($cutoff): bool {
+                return is_numeric($timestamp) && (int) $timestamp >= $cutoff;
+            }));
+            if ($filtered === []) {
+                unset($quotaData['per_ip'][$existingIp]);
+                continue;
+            }
+            $quotaData['per_ip'][$existingIp] = array_map('intval', $filtered);
+        }
+
+        $quotaData['global'][] = $now;
+        if (!isset($quotaData['per_ip'][$ip]) || !is_array($quotaData['per_ip'][$ip])) {
+            $quotaData['per_ip'][$ip] = [];
+        }
+        $quotaData['per_ip'][$ip][] = $now;
+
+        $encoded = json_encode($quotaData, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+        if ($encoded === false) {
+            write_log('SMTP_QUOTA_ERROR', 'Unable to encode quota JSON during record | IP: ' . $ip);
+            return false;
+        }
+
+        rewind($handle);
+        if (!ftruncate($handle, 0)) {
+            write_log('SMTP_QUOTA_ERROR', 'Unable to truncate quota file during record | IP: ' . $ip);
+            return false;
+        }
+        if (fwrite($handle, $encoded) === false) {
+            write_log('SMTP_QUOTA_ERROR', 'Unable to write quota file during record | IP: ' . $ip);
+            return false;
+        }
+        fflush($handle);
+
+        return true;
+    } finally {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+    }
 }
 
 // This variable will hold the HTML for the success/error message
@@ -58,6 +435,23 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     // Consume the used token and immediately issue a fresh one
     unset($_SESSION['csrf_token']);
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+
+    $clientIp = get_client_ip_address();
+    $rateLimit = enforce_rate_limit($clientIp);
+    if (!$rateLimit['allowed']) {
+        http_response_code(429);
+        header('Retry-After: ' . (string) $rateLimit['retry_after']);
+        write_log(
+            'RATE_LIMIT',
+            'Blocked request | IP: ' . $clientIp
+            . ' | limit: ' . $rateLimit['triggered_limit']
+            . ' | timestamp: ' . date('Y-m-d H:i:s')
+            . ' | session_id: ' . session_id()
+        );
+
+        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Too Many Requests</h2>
+                          <p style='color: #FF6B6B; text-align: center;'>You have submitted too many requests. Please wait and try again.</p>";
+    } else {
 
     // --- 1. Trim Raw Inputs ---
     $rawName    = trim($_POST['recipient_name']  ?? '');
@@ -222,6 +616,29 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
     // --- 4. Send Email with PDF Attachment using PHPMailer ---
     if ($pdfGenerated):
+
+    // --- SMTP abuse prevention: daily quota check (fail-closed) ---
+    $smtpQuota = check_smtp_quota($clientIp);
+    if (!$smtpQuota['allowed']) {
+        http_response_code(429);
+        header('Retry-After: ' . (string) $smtpQuota['retry_after']);
+        if ($smtpQuota['quota_type'] === 'global' || $smtpQuota['quota_type'] === 'per_ip') {
+            write_log(
+                'SMTP_QUOTA_BLOCK',
+                'Blocked SMTP quota | IP: ' . $clientIp
+                . ' | quota: ' . $smtpQuota['quota_type']
+                . ' | timestamp: ' . date('Y-m-d H:i:s')
+            );
+        }
+        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Daily Sending Limit Reached</h2>
+                          <p style='color: #FF6B6B; text-align: center;'>This service has reached its sending limit. Please try again later.</p>";
+        if (file_exists($pdfTmpPath)) {
+            $deleted = unlink($pdfTmpPath);
+            if ($deleted === false) {
+                write_log('CLEANUP', 'Failed to delete temporary PDF: ' . basename($pdfTmpPath));
+            }
+        }
+    } else {
     $mail = new PHPMailer(true);
     try {
         // Server settings
@@ -247,6 +664,10 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $mail->addAttachment($pdfTmpPath, $pdfMailName);
 
         $mail->send();
+
+        // Record only successful sends toward quota. The send already succeeded,
+        // so a recording failure is logged internally and does not change the response.
+        record_smtp_success($clientIp);
         
         $outputMessage = "<h2 style='color: #d4af37; margin-bottom: 20px; text-align: center;'>Plan Sent Successfully!</h2>
                           <p style='color: #90EE90; text-align: center;'>The personalized PDF plan has been generated and sent to {$recipientEmail}.</p>";
@@ -265,7 +686,11 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         }
     }
 
+    } // end smtp-quota-allowed block
+
     endif; // end pdfGenerated block
+
+    } // end rate-limit-allowed block
 
     } // end validation-passed block
 
