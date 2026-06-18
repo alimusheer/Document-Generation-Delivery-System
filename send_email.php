@@ -5,13 +5,13 @@ $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
         || (isset($_SERVER['SERVER_PORT']) && (int) $_SERVER['SERVER_PORT'] === 443);
 
 // --- SECURITY HEADERS ---
-// NOTE: Content-Security-Policy must be updated in Issue #8 (Cloudflare Turnstile).
-// When Turnstile is added: script-src and frame-src must include https://challenges.cloudflare.com
+// Cloudflare Turnstile (Issue #8) requires script-src and frame-src to allow
+// https://challenges.cloudflare.com for widget rendering and the challenge iframe.
 header('X-Frame-Options: DENY');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: strict-origin-when-cross-origin');
 header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
-header("Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'");
+header("Content-Security-Policy: default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'self'; form-action 'self'");
 if ($isHttps) {
     header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
 }
@@ -403,6 +403,82 @@ function record_smtp_success(string $ip): bool {
     }
 }
 
+// --- ISSUE #8 HELPER: CLOUDFLARE TURNSTILE VERIFICATION ---
+// Verifies the Turnstile token server-side via cURL. Fail-closed: any missing
+// token, rejected verification, or transport failure blocks the request.
+function verify_turnstile(string $token, string $clientIp): array {
+    $blockResult = ['allowed' => false];
+
+    if ($token === '') {
+        write_log('TURNSTILE_VERIFY_FAIL', 'Missing Turnstile token | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    $secret = $_ENV['TURNSTILE_SECRET_KEY'] ?? '';
+    if ($secret === '') {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Missing Turnstile secret key in configuration | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    if (!function_exists('curl_init')) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'cURL extension unavailable for Turnstile verification | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    $postFields = http_build_query([
+        'secret'   => $secret,
+        'response' => $token,
+        'remoteip' => $clientIp,
+    ]);
+
+    $ch = curl_init('https://challenges.cloudflare.com/turnstile/v0/siteverify');
+    if ($ch === false) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Unable to initialize cURL for Turnstile verification | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $postFields,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 5,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+    ]);
+
+    $response = curl_exec($ch);
+    if ($response === false) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Transport failure during Turnstile verification: ' . curl_error($ch) . ' | IP: ' . $clientIp);
+        curl_close($ch);
+        return $blockResult;
+    }
+
+    $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($httpCode !== 200) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Unexpected HTTP status from Turnstile verification: ' . $httpCode . ' | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    $decoded = json_decode($response, true);
+    if (!is_array($decoded)) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Invalid JSON response from Turnstile verification | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    if (($decoded['success'] ?? null) !== true) {
+        $errorCodes = isset($decoded['error-codes']) && is_array($decoded['error-codes'])
+            ? implode(',', $decoded['error-codes'])
+            : 'none';
+        write_log('TURNSTILE_VERIFY_FAIL', 'Turnstile verification rejected | codes: ' . $errorCodes . ' | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    return ['allowed' => true];
+}
+
 // --- ISSUE #10 HELPERS: USER-FRIENDLY ERROR MESSAGES ---
 // Record a validation failure in both the grouped summary and the field map.
 function add_field_error(array &$fieldErrors, array &$summaryErrors, string $field, string $message): void {
@@ -455,7 +531,7 @@ foreach ($weekDays as $weekDay) {
 try {
     $dotenv = Dotenv\Dotenv::createImmutable(__DIR__);
     $dotenv->load();
-    $dotenv->required(['MAIL_HOST', 'MAIL_USERNAME', 'MAIL_PASSWORD', 'MAIL_PORT', 'MAIL_ENCRYPTION', 'MAIL_FROM_ADDRESS', 'MAIL_FROM_NAME']);
+    $dotenv->required(['MAIL_HOST', 'MAIL_USERNAME', 'MAIL_PASSWORD', 'MAIL_PORT', 'MAIL_ENCRYPTION', 'MAIL_FROM_ADDRESS', 'MAIL_FROM_NAME', 'TURNSTILE_SITE_KEY', 'TURNSTILE_SECRET_KEY']);
 } catch (\Dotenv\Exception\InvalidPathException | \Dotenv\Exception\ValidationException $e) {
     write_log('CONFIG', $e->getMessage());
     $uiState = 'operational_error';
@@ -499,6 +575,18 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $uiState = 'operational_error';
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Too Many Requests</h2>
                           <p style='color: #FF6B6B; text-align: center;'>You have submitted too many requests. Please wait and try again.</p>";
+    } else {
+
+    // --- Turnstile Verification (fail-closed) ---
+    $turnstileToken  = isset($_POST['cf-turnstile-response']) && is_string($_POST['cf-turnstile-response'])
+        ? trim($_POST['cf-turnstile-response'])
+        : '';
+    $turnstileResult = verify_turnstile($turnstileToken, $clientIp);
+    if (!$turnstileResult['allowed']) {
+        http_response_code(403);
+        $uiState = 'operational_error';
+        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Security Verification Failed</h2>
+                          <p style='color: #FF6B6B; text-align: center;'>We could not verify that you are human. Please refresh the page and try again.</p>";
     } else {
 
     // --- 1. Trim Raw Inputs ---
@@ -746,6 +834,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
     endif; // end pdfGenerated block
 
+    } // end turnstile-allowed block
+
     } // end rate-limit-allowed block
 
     } // end validation-passed block
@@ -758,6 +848,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 <head>
     <meta charset="UTF-8">
     <title>Create Premium Workout Plan</title>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <!-- Your existing styles are perfect, no changes needed here -->
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -855,7 +946,11 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                         <?php endforeach; ?>
                     </table>
                 </div>
-                
+
+                <div class="form-section">
+                    <div class="cf-turnstile" data-sitekey="<?php echo htmlspecialchars($_ENV['TURNSTILE_SITE_KEY'] ?? '', ENT_QUOTES, 'UTF-8'); ?>"></div>
+                </div>
+
                 <input type="submit" value="Generate PDF & Send Email">
             </form>
         <?php endif; ?>
