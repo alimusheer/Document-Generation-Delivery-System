@@ -5,13 +5,13 @@ $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
         || (isset($_SERVER['SERVER_PORT']) && (int) $_SERVER['SERVER_PORT'] === 443);
 
 // --- SECURITY HEADERS ---
-// NOTE: Content-Security-Policy must be updated in Issue #8 (Cloudflare Turnstile).
-// When Turnstile is added: script-src and frame-src must include https://challenges.cloudflare.com
+// Cloudflare Turnstile (Issue #8) requires script-src and frame-src to allow
+// https://challenges.cloudflare.com for widget rendering and the challenge iframe.
 header('X-Frame-Options: DENY');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: strict-origin-when-cross-origin');
 header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
-header("Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'");
+header("Content-Security-Policy: default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'self'; form-action 'self'");
 if ($isHttps) {
     header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
 }
@@ -403,16 +403,138 @@ function record_smtp_success(string $ip): bool {
     }
 }
 
+// --- ISSUE #8 HELPER: CLOUDFLARE TURNSTILE VERIFICATION ---
+// Verifies the Turnstile token server-side via cURL. Fail-closed: any missing
+// token, rejected verification, or transport failure blocks the request.
+function verify_turnstile(string $token, string $clientIp): array {
+    $blockResult = ['allowed' => false];
+
+    if ($token === '') {
+        write_log('TURNSTILE_VERIFY_FAIL', 'Missing Turnstile token | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    $secret = $_ENV['TURNSTILE_SECRET_KEY'] ?? '';
+    if ($secret === '') {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Missing Turnstile secret key in configuration | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    if (!function_exists('curl_init')) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'cURL extension unavailable for Turnstile verification | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    $postFields = http_build_query([
+        'secret'   => $secret,
+        'response' => $token,
+        'remoteip' => $clientIp,
+    ]);
+
+    $ch = curl_init('https://challenges.cloudflare.com/turnstile/v0/siteverify');
+    if ($ch === false) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Unable to initialize cURL for Turnstile verification | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $postFields,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 5,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+    ]);
+
+    $response = curl_exec($ch);
+    if ($response === false) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Transport failure during Turnstile verification: ' . curl_error($ch) . ' | IP: ' . $clientIp);
+        curl_close($ch);
+        return $blockResult;
+    }
+
+    $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($httpCode !== 200) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Unexpected HTTP status from Turnstile verification: ' . $httpCode . ' | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    $decoded = json_decode($response, true);
+    if (!is_array($decoded)) {
+        write_log('TURNSTILE_VERIFY_ERROR', 'Invalid JSON response from Turnstile verification | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    if (($decoded['success'] ?? null) !== true) {
+        $errorCodes = isset($decoded['error-codes']) && is_array($decoded['error-codes'])
+            ? implode(',', $decoded['error-codes'])
+            : 'none';
+        write_log('TURNSTILE_VERIFY_FAIL', 'Turnstile verification rejected | codes: ' . $errorCodes . ' | IP: ' . $clientIp);
+        return $blockResult;
+    }
+
+    return ['allowed' => true];
+}
+
+// --- ISSUE #10 HELPERS: USER-FRIENDLY ERROR MESSAGES ---
+// Record a validation failure in both the grouped summary and the field map.
+function add_field_error(array &$fieldErrors, array &$summaryErrors, string $field, string $message): void {
+    $fieldErrors[$field][] = $message;
+    $summaryErrors[] = $message;
+}
+
+// Return the CSS class fragment for an invalid input.
+function field_error_class(array $fieldErrors, string $field): string {
+    return isset($fieldErrors[$field]) ? ' input-error' : '';
+}
+
+// Return escaped inline error text for a field (empty string when valid).
+function render_field_error(array $fieldErrors, string $field): string {
+    if (empty($fieldErrors[$field])) {
+        return '';
+    }
+    $html = '';
+    foreach ($fieldErrors[$field] as $message) {
+        $html .= '<div class="field-error-text">' . htmlspecialchars($message, ENT_QUOTES, 'UTF-8') . '</div>';
+    }
+    return $html;
+}
+
 // This variable will hold the HTML for the success/error message
 $outputMessage = '';
+
+// --- ISSUE #10 UI STATE ---
+// $uiState drives rendering: 'form' | 'validation_error' | 'operational_error' | 'success'.
+$uiState       = 'form';
+$summaryErrors = [];
+$fieldErrors   = [];
+
+$weekDays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+
+// Default form values. Day fields are generated dynamically to avoid manual duplication.
+$defaultIntro = 'Here is the personalized fitness plan we discussed. We have designed this schedule to align perfectly with your goals. Consistency is key, and we are here to support you every step of the way.';
+$formData = [
+    'recipient_name'  => '',
+    'recipient_email' => '',
+    'intro_message'   => $defaultIntro,
+];
+foreach ($weekDays as $weekDay) {
+    $weekDayKey = strtolower($weekDay);
+    $formData[$weekDayKey . '_focus']   = '';
+    $formData[$weekDayKey . '_details'] = '';
+}
 
 // Load environment variables from .env
 try {
     $dotenv = Dotenv\Dotenv::createImmutable(__DIR__);
     $dotenv->load();
-    $dotenv->required(['MAIL_HOST', 'MAIL_USERNAME', 'MAIL_PASSWORD', 'MAIL_PORT', 'MAIL_ENCRYPTION', 'MAIL_FROM_ADDRESS', 'MAIL_FROM_NAME']);
+    $dotenv->required(['MAIL_HOST', 'MAIL_USERNAME', 'MAIL_PASSWORD', 'MAIL_PORT', 'MAIL_ENCRYPTION', 'MAIL_FROM_ADDRESS', 'MAIL_FROM_NAME', 'TURNSTILE_SITE_KEY', 'TURNSTILE_SECRET_KEY']);
 } catch (\Dotenv\Exception\InvalidPathException | \Dotenv\Exception\ValidationException $e) {
     write_log('CONFIG', $e->getMessage());
+    $uiState = 'operational_error';
     $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Application Configuration Error</h2>
                       <p style='color: #FF6B6B; text-align: center;'>The application is not configured correctly. Please contact the administrator.</p>";
 }
@@ -428,6 +550,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     // --- CSRF Validation ---
     if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
         http_response_code(403);
+        $uiState = 'operational_error';
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Security Validation Failed</h2>
                           <p style='color: #FF6B6B; text-align: center;'>Your request could not be verified. Please refresh the page and try again.</p>";
     } else {
@@ -449,8 +572,21 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             . ' | session_id: ' . session_id()
         );
 
+        $uiState = 'operational_error';
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Too Many Requests</h2>
                           <p style='color: #FF6B6B; text-align: center;'>You have submitted too many requests. Please wait and try again.</p>";
+    } else {
+
+    // --- Turnstile Verification (fail-closed) ---
+    $turnstileToken  = isset($_POST['cf-turnstile-response']) && is_string($_POST['cf-turnstile-response'])
+        ? trim($_POST['cf-turnstile-response'])
+        : '';
+    $turnstileResult = verify_turnstile($turnstileToken, $clientIp);
+    if (!$turnstileResult['allowed']) {
+        http_response_code(403);
+        $uiState = 'operational_error';
+        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Security Verification Failed</h2>
+                          <p style='color: #FF6B6B; text-align: center;'>We could not verify that you are human. Please refresh the page and try again.</p>";
     } else {
 
     // --- 1. Trim Raw Inputs ---
@@ -467,45 +603,54 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         ];
     }
 
-    // --- 2. Validate Inputs ---
-    $errors = [];
+    // Repopulate the form with submitted values (used when validation fails).
+    $formData['recipient_name']  = $rawName;
+    $formData['recipient_email'] = $rawEmail;
+    $formData['intro_message']   = $rawIntro;
+    foreach ($days as $day) {
+        $key = strtolower($day);
+        $formData[$key . '_focus']   = $rawPlan[$day]['focus'];
+        $formData[$key . '_details'] = $rawPlan[$day]['details'];
+    }
 
+    // --- 2. Validate Inputs ---
     // recipient_name
     if ($rawName === '') {
-        $errors[] = 'Client name is required.';
+        add_field_error($fieldErrors, $summaryErrors, 'recipient_name', 'Client name is required.');
     } elseif (mb_strlen($rawName) < 2) {
-        $errors[] = 'Client name must be at least 2 characters.';
+        add_field_error($fieldErrors, $summaryErrors, 'recipient_name', 'Client name must be at least 2 characters.');
     } elseif (mb_strlen($rawName) > 100) {
-        $errors[] = 'Client name must not exceed 100 characters.';
+        add_field_error($fieldErrors, $summaryErrors, 'recipient_name', 'Client name must not exceed 100 characters.');
     } elseif (preg_match('/[\/\\\:*?"<>|]/', $rawName)) {
-        $errors[] = 'Client name contains invalid characters.';
+        add_field_error($fieldErrors, $summaryErrors, 'recipient_name', 'Client name contains invalid characters.');
     }
 
     // recipient_email
     if ($rawEmail === '') {
-        $errors[] = 'Email address is required.';
+        add_field_error($fieldErrors, $summaryErrors, 'recipient_email', 'Email address is required.');
     } elseif (mb_strlen($rawEmail) > 254) {
-        $errors[] = 'Email address must not exceed 254 characters.';
+        add_field_error($fieldErrors, $summaryErrors, 'recipient_email', 'Email address must not exceed 254 characters.');
     } elseif (!filter_var($rawEmail, FILTER_VALIDATE_EMAIL)) {
-        $errors[] = 'A valid email address is required.';
+        add_field_error($fieldErrors, $summaryErrors, 'recipient_email', 'A valid email address is required.');
     }
 
     // intro_message
     if ($rawIntro === '') {
-        $errors[] = 'Introductory message is required.';
+        add_field_error($fieldErrors, $summaryErrors, 'intro_message', 'Introductory message is required.');
     } elseif (mb_strlen($rawIntro) < 10) {
-        $errors[] = 'Introductory message must be at least 10 characters.';
+        add_field_error($fieldErrors, $summaryErrors, 'intro_message', 'Introductory message must be at least 10 characters.');
     } elseif (mb_strlen($rawIntro) > 2000) {
-        $errors[] = 'Introductory message must not exceed 2000 characters.';
+        add_field_error($fieldErrors, $summaryErrors, 'intro_message', 'Introductory message must not exceed 2000 characters.');
     }
 
     // day_focus and day_details (optional, length limits only)
     foreach ($days as $day) {
+        $key = strtolower($day);
         if (mb_strlen($rawPlan[$day]['focus']) > 150) {
-            $errors[] = $day . ' workout focus must not exceed 150 characters.';
+            add_field_error($fieldErrors, $summaryErrors, $key . '_focus', $day . ' workout focus must not exceed 150 characters.');
         }
         if (mb_strlen($rawPlan[$day]['details']) > 500) {
-            $errors[] = $day . ' details must not exceed 500 characters.';
+            add_field_error($fieldErrors, $summaryErrors, $key . '_details', $day . ' details must not exceed 500 characters.');
         }
     }
 
@@ -518,17 +663,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         }
     }
     if (!$hasAnyPlan) {
-        $errors[] = 'At least one day must have a workout focus or details.';
+        add_field_error($fieldErrors, $summaryErrors, 'plan', 'At least one day must have a workout focus or details.');
     }
 
     // --- 3. Stop and display errors if validation failed ---
-    if (!empty($errors)) {
-        $errorItems = '';
-        foreach ($errors as $error) {
-            $errorItems .= "<li>" . htmlspecialchars($error) . "</li>";
-        }
-        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Please correct the following errors:</h2>
-                          <ul style='color: #FF6B6B; margin-top: 12px; padding-left: 20px; line-height: 2;'>{$errorItems}</ul>";
+    if (!empty($summaryErrors)) {
+        $uiState = 'validation_error';
     } else {
 
     // --- 4. Sanitize and Capture Form Data ---
@@ -607,6 +747,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         $pdfGenerated = true;
     } catch (\Throwable $e) {
         write_log('PDF', get_class($e) . ': ' . $e->getMessage() . ' in ' . basename($e->getFile()) . ':' . $e->getLine());
+        $uiState = 'operational_error';
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>PDF Generation Failed</h2>
                           <p style='color: #FF6B6B; text-align: center;'>Your plan could not be generated at this time. Please try again later.</p>";
         if (file_exists($pdfTmpPath)) {
@@ -630,6 +771,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 . ' | timestamp: ' . date('Y-m-d H:i:s')
             );
         }
+        $uiState = 'operational_error';
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Daily Sending Limit Reached</h2>
                           <p style='color: #FF6B6B; text-align: center;'>This service has reached its sending limit. Please try again later.</p>";
         if (file_exists($pdfTmpPath)) {
@@ -669,11 +811,13 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         // so a recording failure is logged internally and does not change the response.
         record_smtp_success($clientIp);
         
+        $uiState = 'success';
         $outputMessage = "<h2 style='color: #d4af37; margin-bottom: 20px; text-align: center;'>Plan Sent Successfully!</h2>
                           <p style='color: #90EE90; text-align: center;'>The personalized PDF plan has been generated and sent to {$recipientEmail}.</p>";
 
     } catch (Exception $e) {
         write_log('MAIL', $e->getMessage() . ' | ErrorInfo: ' . $mail->ErrorInfo);
+        $uiState = 'operational_error';
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Email Could Not Be Sent</h2>
                           <p style='color: #FF6B6B; text-align: center;'>Your plan could not be delivered at this time. Please try again later.</p>";
     } finally {
@@ -690,6 +834,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
     endif; // end pdfGenerated block
 
+    } // end turnstile-allowed block
+
     } // end rate-limit-allowed block
 
     } // end validation-passed block
@@ -702,6 +848,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 <head>
     <meta charset="UTF-8">
     <title>Create Premium Workout Plan</title>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <!-- Your existing styles are perfect, no changes needed here -->
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -725,6 +872,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         .plan-table td input { background: rgba(10, 14, 39, 0.9); }
         input[type="submit"] { width: 100%; background: linear-gradient(135deg, #d4af37, #c9a961); color: #0a0e27; font-weight: 700; padding: 16px; border: none; border-radius: 4px; cursor: pointer; transition: all 0.3s ease; letter-spacing: 1px; font-size: 14px; }
         input[type="submit"]:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(212, 175, 55, 0.4); }
+        .alert-validation { background: rgba(255, 107, 107, 0.08); border: 1px solid rgba(255, 107, 107, 0.4); border-radius: 8px; padding: 24px 28px; margin-bottom: 28px; }
+        .validation-summary h2 { font-size: 18px; color: #FF6B6B; font-weight: 500; letter-spacing: 1px; margin-bottom: 12px; }
+        .validation-summary ul { color: #FF6B6B; padding-left: 20px; line-height: 1.9; }
+        .alert-operational { border-color: rgba(255, 107, 107, 0.35); }
+        .input-error { border-color: #FF6B6B !important; box-shadow: 0 0 12px rgba(255, 107, 107, 0.25) !important; }
+        .field-error-text { color: #FF6B6B; font-size: 12px; margin-top: 6px; letter-spacing: 0.3px; }
     </style>
 </head>
 <body>
@@ -735,47 +888,69 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             <p class="subtitle">For Premium Clients</p>
         </div>
 
-        <?php if (!empty($outputMessage)): ?>
-            <div class="result-container">
+        <?php if ($uiState === 'success' || $uiState === 'operational_error'): ?>
+            <div class="result-container<?php echo $uiState === 'operational_error' ? ' alert-operational' : ''; ?>">
                 <?php echo $outputMessage; ?>
             </div>
         <?php else: ?>
-            <form action="<?php echo htmlspecialchars($_SERVER["PHP_SELF"]); ?>" method="post">
+            <?php if ($uiState === 'validation_error'): ?>
+                <div class="alert-validation validation-summary">
+                    <h2>Please correct the following errors:</h2>
+                    <ul>
+                        <?php foreach ($summaryErrors as $summaryError): ?>
+                            <li><?php echo htmlspecialchars($summaryError, ENT_QUOTES, 'UTF-8'); ?></li>
+                        <?php endforeach; ?>
+                    </ul>
+                </div>
+            <?php endif; ?>
+            <form action="<?php echo htmlspecialchars($_SERVER["PHP_SELF"]); ?>" method="post" novalidate>
                 <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                 <div class="section-title">Client Details</div>
                 <div class="form-section grid-2">
                     <div>
                         <label for="recipient_name">Client Name</label>
-                        <input type="text" id="recipient_name" name="recipient_name" required>
+                        <input type="text" id="recipient_name" name="recipient_name" class="<?php echo trim(field_error_class($fieldErrors, 'recipient_name')); ?>" value="<?php echo htmlspecialchars($formData['recipient_name'], ENT_QUOTES, 'UTF-8'); ?>" required>
+                        <?php echo render_field_error($fieldErrors, 'recipient_name'); ?>
                     </div>
                     <div>
                         <label for="recipient_email">Client Email</label>
-                        <input type="email" id="recipient_email" name="recipient_email" required>
+                        <input type="email" id="recipient_email" name="recipient_email" class="<?php echo trim(field_error_class($fieldErrors, 'recipient_email')); ?>" value="<?php echo htmlspecialchars($formData['recipient_email'], ENT_QUOTES, 'UTF-8'); ?>" required>
+                        <?php echo render_field_error($fieldErrors, 'recipient_email'); ?>
                     </div>
                 </div>
                 <div class="form-section">
                     <label for="intro_message">Introductory Message (for PDF)</label>
-                    <textarea id="intro_message" name="intro_message" required>Here is the personalized fitness plan we discussed. We have designed this schedule to align perfectly with your goals. Consistency is key, and we are here to support you every step of the way.</textarea>
+                    <textarea id="intro_message" name="intro_message" class="<?php echo trim(field_error_class($fieldErrors, 'intro_message')); ?>" required><?php echo htmlspecialchars($formData['intro_message'], ENT_QUOTES, 'UTF-8'); ?></textarea>
+                    <?php echo render_field_error($fieldErrors, 'intro_message'); ?>
                 </div>
 
                 <div class="section-title">Weekly Workout & Diet Plan</div>
                 <div class="form-section">
+                    <?php echo render_field_error($fieldErrors, 'plan'); ?>
                     <table class="plan-table">
                         <tr><th>Day</th><th>Workout Focus</th><th>Details / Exercises</th></tr>
-                        <?php 
-                        $days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-                        foreach ($days as $day): 
+                        <?php foreach ($weekDays as $day):
                             $day_lower = strtolower($day);
                         ?>
                         <tr>
                             <td><strong><?php echo $day; ?></strong></td>
-                            <td><input type="text" name="<?php echo $day_lower; ?>_focus" placeholder="e.g., Chest & Triceps"></td>
-                            <td><input type="text" name="<?php echo $day_lower; ?>_details" placeholder="e.g., Bench Press 4x10, Dips 3x12..."></td>
+                            <td>
+                                <input type="text" name="<?php echo $day_lower; ?>_focus" class="<?php echo trim(field_error_class($fieldErrors, $day_lower . '_focus')); ?>" value="<?php echo htmlspecialchars($formData[$day_lower . '_focus'], ENT_QUOTES, 'UTF-8'); ?>" placeholder="e.g., Chest & Triceps">
+                                <?php echo render_field_error($fieldErrors, $day_lower . '_focus'); ?>
+                            </td>
+                            <td>
+                                <input type="text" name="<?php echo $day_lower; ?>_details" class="<?php echo trim(field_error_class($fieldErrors, $day_lower . '_details')); ?>" value="<?php echo htmlspecialchars($formData[$day_lower . '_details'], ENT_QUOTES, 'UTF-8'); ?>" placeholder="e.g., Bench Press 4x10, Dips 3x12...">
+                                <?php echo render_field_error($fieldErrors, $day_lower . '_details'); ?>
+                            </td>
                         </tr>
                         <?php endforeach; ?>
                     </table>
                 </div>
-                
+
+                <div class="form-section">
+                    <div class="cf-turnstile" data-sitekey="<?php echo htmlspecialchars($_ENV['TURNSTILE_SITE_KEY'] ?? '', ENT_QUOTES, 'UTF-8'); ?>"></div>
+                </div>
+
                 <input type="submit" value="Generate PDF & Send Email">
             </form>
         <?php endif; ?>

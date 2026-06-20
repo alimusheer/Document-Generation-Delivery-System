@@ -112,16 +112,52 @@ Access the application through your web server.
 * Temporary File Cleanup
 * Dependency Management
 * Repository Cleanup and Modernization
-
-### Planned Improvements
-
 * Environment-Based Configuration
 * CSRF Protection
+* Security Response Headers
+* Session Hardening
 * Enhanced Input Validation
 * Logging System
 * Rate Limiting
+* SMTP Abuse Protection (daily global and per-IP quotas)
+* Cloudflare Turnstile Bot Protection
 * Improved Error Handling
-* Security Hardening
+* Deployment Security Checklist (maintained privately)
+
+### Planned Improvements
+
+* Transactional email provider integration for production deliverability
+
+---
+
+## Security
+
+This application includes several production-oriented security measures:
+
+* Environment-based configuration via `.env`
+* CSRF protection on form submission
+* Security response headers (Content-Security-Policy, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy)
+* Hardened session cookies (HttpOnly, SameSite, Secure)
+* Per-IP rate limiting
+* SMTP abuse protection with daily global and per-IP quotas
+* Cloudflare Turnstile bot protection on form submission
+* Application logging for security-relevant failures
+
+### Composer Security Audit
+
+Date: 2026-06-18
+
+Command:
+
+```bash
+composer audit
+```
+
+Result:
+
+```
+No security vulnerability advisories found.
+```
 
 ---
 
