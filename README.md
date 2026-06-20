@@ -54,7 +54,7 @@ While the current implementation uses a fitness plan template as a demonstration
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/Ali-Hassan-Mushir/Document-Generation-Delivery-System.git
+git clone https://github.com/alimusheer/Document-Generation-Delivery-System.git
 ```
 
 ### 2. Install Dependencies
@@ -124,9 +124,16 @@ Access the application through your web server.
 * Improved Error Handling
 * Deployment Security Checklist (maintained privately)
 
-### Planned Improvements
+### 🚀 Production Scaling (SMTP vs. API)
 
-* Transactional email provider integration for production deliverability
+Currently, this system uses **standard SMTP** for email delivery. This is perfect for this live demonstration, keeping the architecture simple, secure, and isolated from standard spam risks through rate limiting and Cloudflare Turnstile.
+
+However, the backend is built to be modular. If a business needs to deploy this system to handle hundreds of clients daily, the email engine can easily be swapped from SMTP to a **Transactional Email API** (like Resend or SendGrid). 
+
+Upgrading to an API provides a business with:
+* **Guaranteed Deliverability:** Bypasses standard spam filters so the PDF always hits the main inbox.
+* **High Volume:** Ability to blast out thousands of documents per minute without hitting daily limits.
+* **Live Tracking:** Dashboards to see exactly when a client successfully received and opened their document.
 
 ---
 
