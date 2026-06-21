@@ -1,5 +1,5 @@
 Options -Indexes
-DirectoryIndex send_email.php
+DirectoryIndex index.php
 
 # --- SECURITY: deny direct access to sensitive files ---
 <FilesMatch "\.(log)$">
@@ -27,4 +27,4 @@ RewriteRule ^Docs(/|$) - [F,L]
 # Front-controller catch-all (runs only after the security deny rules above)
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
-RewriteRule ^ send_email.php [L]
+RewriteRule ^ index.php [L]

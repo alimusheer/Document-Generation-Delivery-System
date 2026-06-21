@@ -13,17 +13,11 @@ require_once __DIR__ . '/src/Validation/rules.php';
 require_once __DIR__ . '/src/PDF/plan_template.php';
 require_once __DIR__ . '/src/PDF/pdf_generator.php';
 require_once __DIR__ . '/src/Mail/mailer.php';
+require_once __DIR__ . '/src/Http/request_handler.php';
 
 // --- SETUP & AUTOLOADING ---
-use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\SMTP;
-use PHPMailer\PHPMailer\Exception;
-
 // Load Composer's autoloader for PHPMailer and mPDF
 require 'vendor/autoload.php';
-
-
-
 
 // This variable will hold the HTML for the success/error message
 $outputMessage = '';
@@ -63,143 +57,12 @@ csrf_generate();
 
 // --- PROCESS THE FORM WHEN SUBMITTED ---
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
-
-    // --- CSRF Validation ---
-    if (!csrf_validate()) {
-        http_response_code(403);
-        $uiState = 'operational_error';
-        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Security Validation Failed</h2>
-                          <p style='color: #FF6B6B; text-align: center;'>Your request could not be verified. Please refresh the page and try again.</p>";
-    } else {
-
-    // Consume the used token and immediately issue a fresh one
-    csrf_rotate();
-
     $clientIp = get_client_ip_address();
-    $rateLimit = enforce_rate_limit($clientIp);
-    if (!$rateLimit['allowed']) {
-        http_response_code(429);
-        header('Retry-After: ' . (string) $rateLimit['retry_after']);
-        write_log(
-            'RATE_LIMIT',
-            'Blocked request | IP: ' . $clientIp
-            . ' | limit: ' . $rateLimit['triggered_limit']
-            . ' | timestamp: ' . date('Y-m-d H:i:s')
-            . ' | session_id: ' . session_id()
-        );
-
-        $uiState = 'operational_error';
-        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Too Many Requests</h2>
-                          <p style='color: #FF6B6B; text-align: center;'>You have submitted too many requests. Please wait and try again.</p>";
-    } else {
-
-    // --- Turnstile Verification (fail-closed) ---
-    $turnstileToken  = isset($_POST['cf-turnstile-response']) && is_string($_POST['cf-turnstile-response'])
-        ? trim($_POST['cf-turnstile-response'])
-        : '';
-    $turnstileResult = verify_turnstile($turnstileToken, $clientIp);
-    if (!$turnstileResult['allowed']) {
-        http_response_code(403);
-        $uiState = 'operational_error';
-        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Security Verification Failed</h2>
-                          <p style='color: #FF6B6B; text-align: center;'>We could not verify that you are human. Please refresh the page and try again.</p>";
-    } else {
-
-    // --- 1. Trim Raw Inputs ---
-    $normalized = normalize_inputs($_POST, $formData);
-    $rawName    = $normalized['recipient_name'];
-    $rawEmail   = $normalized['recipient_email'];
-    $rawIntro   = $normalized['intro_message'];
-    $rawPlan    = $normalized['plan'];
-
-    // --- 2. Validate Inputs ---
-    validate_inputs($rawName, $rawEmail, $rawIntro, $rawPlan, $fieldErrors, $summaryErrors);
-
-    // --- 3. Stop and display errors if validation failed ---
-    if (!empty($summaryErrors)) {
-        $uiState = 'validation_error';
-    } else {
-
-    // --- 4. Sanitize and Capture Form Data ---
-    $recipientName = htmlspecialchars($_POST["recipient_name"]);
-    $recipientEmail = filter_var($_POST["recipient_email"], FILTER_SANITIZE_EMAIL);
-    $introMessage = nl2br(htmlspecialchars($_POST["intro_message"])); // Convert newlines to <br> for HTML
-    $planData = [];
-
-    // Loop through each day of the week to get the plan
-    $days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-    foreach ($days as $day) {
-        $planData[$day] = [
-            'focus' => htmlspecialchars($_POST[strtolower($day) . '_focus'] ?? ''),
-            'details' => htmlspecialchars($_POST[strtolower($day) . '_details'] ?? '')
-        ];
-    }
-
-    // --- 2. Build the Premium HTML for the PDF ---
-    $htmlForPdf = render_plan_template($recipientName, $introMessage, $planData);
-
-    // --- 3. Generate PDF using mPDF ---
-    $pdfMailName = 'Elite_Fitness_Plan_' . str_replace(' ', '_', $recipientName) . '.pdf';
-    $pdfTmpPath  = __DIR__ . '/tmp/' . bin2hex(random_bytes(8)) . '.pdf';
-    
-    $pdfGenerated = generate_pdf($htmlForPdf, $pdfTmpPath);
-    if (!$pdfGenerated) {
-        $uiState = 'operational_error';
-        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>PDF Generation Failed</h2>
-                          <p style='color: #FF6B6B; text-align: center;'>Your plan could not be generated at this time. Please try again later.</p>";
-    }
-
-    // --- 4. Send Email with PDF Attachment using PHPMailer ---
-    if ($pdfGenerated):
-
-    // --- SMTP abuse prevention: daily quota check (fail-closed) ---
-    $smtpQuota = check_smtp_quota($clientIp);
-    if (!$smtpQuota['allowed']) {
-        http_response_code(429);
-        header('Retry-After: ' . (string) $smtpQuota['retry_after']);
-        if ($smtpQuota['quota_type'] === 'global' || $smtpQuota['quota_type'] === 'per_ip') {
-            write_log(
-                'SMTP_QUOTA_BLOCK',
-                'Blocked SMTP quota | IP: ' . $clientIp
-                . ' | quota: ' . $smtpQuota['quota_type']
-                . ' | timestamp: ' . date('Y-m-d H:i:s')
-            );
-        }
-        $uiState = 'operational_error';
-        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Daily Sending Limit Reached</h2>
-                          <p style='color: #FF6B6B; text-align: center;'>This service has reached its sending limit. Please try again later.</p>";
-        if (file_exists($pdfTmpPath)) {
-            $deleted = unlink($pdfTmpPath);
-            if ($deleted === false) {
-                write_log('CLEANUP', 'Failed to delete temporary PDF: ' . basename($pdfTmpPath));
-            }
-        }
-    } else {
-        $mailSent = send_plan_email($recipientEmail, $recipientName, $pdfTmpPath, $pdfMailName);
-        if ($mailSent) {
-            // Record only successful sends toward quota. The send already succeeded,
-            // so a recording failure is logged internally and does not change the response.
-            record_smtp_success($clientIp);
-            
-            $uiState = 'success';
-            $outputMessage = "<h2 style='color: #d4af37; margin-bottom: 20px; text-align: center;'>Plan Sent Successfully!</h2>
-                              <p style='color: #90EE90; text-align: center;'>The personalized PDF plan has been generated and sent to {$recipientEmail}.</p>";
-        } else {
-            $uiState = 'operational_error';
-            $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Email Could Not Be Sent</h2>
-                              <p style='color: #FF6B6B; text-align: center;'>Your plan could not be delivered at this time. Please try again later.</p>";
-        }
-    } // end smtp-quota-allowed block
-
-    endif; // end pdfGenerated block
-
-    } // end turnstile-allowed block
-
-    } // end rate-limit-allowed block
-
-    } // end validation-passed block
-
-    } // end CSRF-valid block
+    $result = handle_post_request($_POST, $formData, $clientIp);
+    $uiState       = $result['uiState'];
+    $outputMessage = $result['outputMessage'];
+    $summaryErrors = $result['summaryErrors'];
+    $fieldErrors   = $result['fieldErrors'];
 }
 ?>
 <!DOCTYPE html>
@@ -208,7 +71,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     <meta charset="UTF-8">
     <title>Create Premium Workout Plan</title>
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-    <!-- Your existing styles are perfect, no changes needed here -->
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 50%, #0f1729 100%); color: #e8dcc8; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; padding: 50px 20px; }
