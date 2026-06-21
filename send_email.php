@@ -12,6 +12,7 @@ require_once __DIR__ . '/src/Validation/input_normalizer.php';
 require_once __DIR__ . '/src/Validation/rules.php';
 require_once __DIR__ . '/src/PDF/plan_template.php';
 require_once __DIR__ . '/src/PDF/pdf_generator.php';
+require_once __DIR__ . '/src/Mail/mailer.php';
 
 // --- SETUP & AUTOLOADING ---
 use PHPMailer\PHPMailer\PHPMailer;
@@ -174,55 +175,20 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             }
         }
     } else {
-    $mail = new PHPMailer(true);
-    try {
-        // Server settings
-        $mail->isSMTP();
-        $mail->Host       = $_ENV['MAIL_HOST'];
-        $mail->SMTPAuth   = true;
-        $mail->Username   = $_ENV['MAIL_USERNAME'];
-        $mail->Password   = $_ENV['MAIL_PASSWORD'];
-        $mail->SMTPSecure = $_ENV['MAIL_ENCRYPTION'];
-        $mail->Port       = (int) $_ENV['MAIL_PORT'];
-        $mail->CharSet    = 'UTF-8';
-
-        // Recipients
-        $mail->setFrom($_ENV['MAIL_FROM_ADDRESS'], $_ENV['MAIL_FROM_NAME']);
-        $mail->addAddress($recipientEmail, $recipientName);
-
-        // Content
-        $mail->isHTML(true);
-        $mail->Subject = 'Your Personalized Elite Fitness Plan is Here!';
-        $mail->Body    = "Hello {$recipientName},<br><br>Your personalized fitness plan is ready. Please find the attached PDF, which contains your full weekly schedule.<br><br>We are excited to be part of your fitness journey.<br><br>To your health,<br>The Elite Fitness Team";
-        
-        // Attach the generated PDF
-        $mail->addAttachment($pdfTmpPath, $pdfMailName);
-
-        $mail->send();
-
-        // Record only successful sends toward quota. The send already succeeded,
-        // so a recording failure is logged internally and does not change the response.
-        record_smtp_success($clientIp);
-        
-        $uiState = 'success';
-        $outputMessage = "<h2 style='color: #d4af37; margin-bottom: 20px; text-align: center;'>Plan Sent Successfully!</h2>
-                          <p style='color: #90EE90; text-align: center;'>The personalized PDF plan has been generated and sent to {$recipientEmail}.</p>";
-
-    } catch (Exception $e) {
-        write_log('MAIL', $e->getMessage() . ' | ErrorInfo: ' . $mail->ErrorInfo);
-        $uiState = 'operational_error';
-        $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Email Could Not Be Sent</h2>
-                          <p style='color: #FF6B6B; text-align: center;'>Your plan could not be delivered at this time. Please try again later.</p>";
-    } finally {
-        // Delete the temporary PDF file from the server
-        if (file_exists($pdfTmpPath)) {
-            $deleted = unlink($pdfTmpPath);
-            if ($deleted === false) {
-                write_log('CLEANUP', 'Failed to delete temporary PDF: ' . basename($pdfTmpPath));
-            }
+        $mailSent = send_plan_email($recipientEmail, $recipientName, $pdfTmpPath, $pdfMailName);
+        if ($mailSent) {
+            // Record only successful sends toward quota. The send already succeeded,
+            // so a recording failure is logged internally and does not change the response.
+            record_smtp_success($clientIp);
+            
+            $uiState = 'success';
+            $outputMessage = "<h2 style='color: #d4af37; margin-bottom: 20px; text-align: center;'>Plan Sent Successfully!</h2>
+                              <p style='color: #90EE90; text-align: center;'>The personalized PDF plan has been generated and sent to {$recipientEmail}.</p>";
+        } else {
+            $uiState = 'operational_error';
+            $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Email Could Not Be Sent</h2>
+                              <p style='color: #FF6B6B; text-align: center;'>Your plan could not be delivered at this time. Please try again later.</p>";
         }
-    }
-
     } // end smtp-quota-allowed block
 
     endif; // end pdfGenerated block
