@@ -1,6 +1,7 @@
 <?php
 require_once __DIR__ . '/src/Security/headers.php';
 require_once __DIR__ . '/src/Security/session.php';
+require_once __DIR__ . '/src/Security/csrf.php';
 require_once __DIR__ . '/src/Support/paths.php';
 require_once __DIR__ . '/src/Logging/logger.php';
 
@@ -495,15 +496,13 @@ if (!$configResult['success']) {
 }
 
 // Generate a CSRF token for this session if one does not exist
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
+csrf_generate();
 
 // --- PROCESS THE FORM WHEN SUBMITTED ---
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
     // --- CSRF Validation ---
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+    if (!csrf_validate()) {
         http_response_code(403);
         $uiState = 'operational_error';
         $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Security Validation Failed</h2>
@@ -511,8 +510,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     } else {
 
     // Consume the used token and immediately issue a fresh one
-    unset($_SESSION['csrf_token']);
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    csrf_rotate();
 
     $clientIp = get_client_ip_address();
     $rateLimit = enforce_rate_limit($clientIp);
