@@ -509,12 +509,9 @@ foreach ($weekDays as $weekDay) {
 }
 
 // Load environment variables from .env
-try {
-    $dotenv = Dotenv\Dotenv::createImmutable(__DIR__);
-    $dotenv->load();
-    $dotenv->required(['MAIL_HOST', 'MAIL_USERNAME', 'MAIL_PASSWORD', 'MAIL_PORT', 'MAIL_ENCRYPTION', 'MAIL_FROM_ADDRESS', 'MAIL_FROM_NAME', 'TURNSTILE_SITE_KEY', 'TURNSTILE_SECRET_KEY']);
-} catch (\Dotenv\Exception\InvalidPathException | \Dotenv\Exception\ValidationException $e) {
-    write_log('CONFIG', $e->getMessage());
+$configResult = require_once __DIR__ . '/src/Config/bootstrap.php';
+if (!$configResult['success']) {
+    write_log('CONFIG', $configResult['exception_message']);
     $uiState = 'operational_error';
     $outputMessage = "<h2 style='color: #FF6B6B; text-align: center;'>Application Configuration Error</h2>
                       <p style='color: #FF6B6B; text-align: center;'>The application is not configured correctly. Please contact the administrator.</p>";
