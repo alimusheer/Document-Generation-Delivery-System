@@ -7,6 +7,9 @@ require_once __DIR__ . '/src/Security/rate_limiter.php';
 require_once __DIR__ . '/src/Support/paths.php';
 require_once __DIR__ . '/src/Logging/logger.php';
 require_once __DIR__ . '/src/Quota/smtp_quota.php';
+require_once __DIR__ . '/src/Validation/errors.php';
+require_once __DIR__ . '/src/Validation/input_normalizer.php';
+require_once __DIR__ . '/src/Validation/rules.php';
 
 // --- SETUP & AUTOLOADING ---
 use PHPMailer\PHPMailer\PHPMailer;
@@ -18,29 +21,6 @@ require 'vendor/autoload.php';
 
 
 
-// --- ISSUE #10 HELPERS: USER-FRIENDLY ERROR MESSAGES ---
-// Record a validation failure in both the grouped summary and the field map.
-function add_field_error(array &$fieldErrors, array &$summaryErrors, string $field, string $message): void {
-    $fieldErrors[$field][] = $message;
-    $summaryErrors[] = $message;
-}
-
-// Return the CSS class fragment for an invalid input.
-function field_error_class(array $fieldErrors, string $field): string {
-    return isset($fieldErrors[$field]) ? ' input-error' : '';
-}
-
-// Return escaped inline error text for a field (empty string when valid).
-function render_field_error(array $fieldErrors, string $field): string {
-    if (empty($fieldErrors[$field])) {
-        return '';
-    }
-    $html = '';
-    foreach ($fieldErrors[$field] as $message) {
-        $html .= '<div class="field-error-text">' . htmlspecialchars($message, ENT_QUOTES, 'UTF-8') . '</div>';
-    }
-    return $html;
-}
 
 // This variable will hold the HTML for the success/error message
 $outputMessage = '';
@@ -123,81 +103,14 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     } else {
 
     // --- 1. Trim Raw Inputs ---
-    $rawName    = trim($_POST['recipient_name']  ?? '');
-    $rawEmail   = trim($_POST['recipient_email'] ?? '');
-    $rawIntro   = trim($_POST['intro_message']   ?? '');
-    $days       = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-    $rawPlan    = [];
-    foreach ($days as $day) {
-        $key = strtolower($day);
-        $rawPlan[$day] = [
-            'focus'   => trim($_POST[$key . '_focus']   ?? ''),
-            'details' => trim($_POST[$key . '_details'] ?? ''),
-        ];
-    }
-
-    // Repopulate the form with submitted values (used when validation fails).
-    $formData['recipient_name']  = $rawName;
-    $formData['recipient_email'] = $rawEmail;
-    $formData['intro_message']   = $rawIntro;
-    foreach ($days as $day) {
-        $key = strtolower($day);
-        $formData[$key . '_focus']   = $rawPlan[$day]['focus'];
-        $formData[$key . '_details'] = $rawPlan[$day]['details'];
-    }
+    $normalized = normalize_inputs($_POST, $formData);
+    $rawName    = $normalized['recipient_name'];
+    $rawEmail   = $normalized['recipient_email'];
+    $rawIntro   = $normalized['intro_message'];
+    $rawPlan    = $normalized['plan'];
 
     // --- 2. Validate Inputs ---
-    // recipient_name
-    if ($rawName === '') {
-        add_field_error($fieldErrors, $summaryErrors, 'recipient_name', 'Client name is required.');
-    } elseif (mb_strlen($rawName) < 2) {
-        add_field_error($fieldErrors, $summaryErrors, 'recipient_name', 'Client name must be at least 2 characters.');
-    } elseif (mb_strlen($rawName) > 100) {
-        add_field_error($fieldErrors, $summaryErrors, 'recipient_name', 'Client name must not exceed 100 characters.');
-    } elseif (preg_match('/[\/\\\:*?"<>|]/', $rawName)) {
-        add_field_error($fieldErrors, $summaryErrors, 'recipient_name', 'Client name contains invalid characters.');
-    }
-
-    // recipient_email
-    if ($rawEmail === '') {
-        add_field_error($fieldErrors, $summaryErrors, 'recipient_email', 'Email address is required.');
-    } elseif (mb_strlen($rawEmail) > 254) {
-        add_field_error($fieldErrors, $summaryErrors, 'recipient_email', 'Email address must not exceed 254 characters.');
-    } elseif (!filter_var($rawEmail, FILTER_VALIDATE_EMAIL)) {
-        add_field_error($fieldErrors, $summaryErrors, 'recipient_email', 'A valid email address is required.');
-    }
-
-    // intro_message
-    if ($rawIntro === '') {
-        add_field_error($fieldErrors, $summaryErrors, 'intro_message', 'Introductory message is required.');
-    } elseif (mb_strlen($rawIntro) < 10) {
-        add_field_error($fieldErrors, $summaryErrors, 'intro_message', 'Introductory message must be at least 10 characters.');
-    } elseif (mb_strlen($rawIntro) > 2000) {
-        add_field_error($fieldErrors, $summaryErrors, 'intro_message', 'Introductory message must not exceed 2000 characters.');
-    }
-
-    // day_focus and day_details (optional, length limits only)
-    foreach ($days as $day) {
-        $key = strtolower($day);
-        if (mb_strlen($rawPlan[$day]['focus']) > 150) {
-            add_field_error($fieldErrors, $summaryErrors, $key . '_focus', $day . ' workout focus must not exceed 150 characters.');
-        }
-        if (mb_strlen($rawPlan[$day]['details']) > 500) {
-            add_field_error($fieldErrors, $summaryErrors, $key . '_details', $day . ' details must not exceed 500 characters.');
-        }
-    }
-
-    // Business rule: at least one day must have a focus or details entry
-    $hasAnyPlan = false;
-    foreach ($days as $day) {
-        if ($rawPlan[$day]['focus'] !== '' || $rawPlan[$day]['details'] !== '') {
-            $hasAnyPlan = true;
-            break;
-        }
-    }
-    if (!$hasAnyPlan) {
-        add_field_error($fieldErrors, $summaryErrors, 'plan', 'At least one day must have a workout focus or details.');
-    }
+    validate_inputs($rawName, $rawEmail, $rawIntro, $rawPlan, $fieldErrors, $summaryErrors);
 
     // --- 3. Stop and display errors if validation failed ---
     if (!empty($summaryErrors)) {
