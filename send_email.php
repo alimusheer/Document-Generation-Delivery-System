@@ -24,14 +24,8 @@ session_start([
     'use_strict_mode' => true,
 ]);
 
-define('RATE_LIMIT_PER_MINUTE', 5);
-define('RATE_LIMIT_PER_HOUR', 20);
-define('RATE_LIMIT_FILE', __DIR__ . '/tmp/rate_limits.json');
-
-define('SMTP_QUOTA_GLOBAL_PER_DAY', 100);
-define('SMTP_QUOTA_PER_IP_PER_DAY', 10);
-define('SMTP_QUOTA_WINDOW_SECONDS', 86400);
-define('SMTP_QUOTA_FILE', __DIR__ . '/tmp/smtp_quotas.json');
+require_once __DIR__ . '/src/Support/paths.php';
+require_once __DIR__ . '/src/Logging/logger.php';
 
 // --- SETUP & AUTOLOADING ---
 use PHPMailer\PHPMailer\PHPMailer;
@@ -41,19 +35,6 @@ use PHPMailer\PHPMailer\Exception;
 // Load Composer's autoloader for PHPMailer and mPDF
 require 'vendor/autoload.php';
 
-// --- LOGGING HELPER ---
-function write_log(string $context, string $message): void {
-    $logDir  = __DIR__ . '/logs';
-    $logFile = $logDir . '/app.log';
-    if (!is_dir($logDir)) {
-        mkdir($logDir, 0755, true);
-    }
-    if (file_exists($logFile) && filesize($logFile) > 1048576) {
-        rename($logFile, $logDir . '/app.log.bak');
-    }
-    $entry = '[' . date('Y-m-d H:i:s') . '] [ERROR] [' . $context . '] ' . $message . PHP_EOL;
-    file_put_contents($logFile, $entry, FILE_APPEND | LOCK_EX);
-}
 
 function get_client_ip_address(): string {
     return $_SERVER['REMOTE_ADDR'] ?? 'unknown';
