@@ -64,7 +64,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     $summaryErrors = $result['summaryErrors'];
     $fieldErrors   = $result['fieldErrors'];
 }
-?>
 if ($uiState === 'success' || $uiState === 'operational_error') {
     require __DIR__ . '/views/result.php';
 } else {
