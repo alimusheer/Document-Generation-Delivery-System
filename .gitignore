@@ -7,15 +7,6 @@
 /logs/*
 !/logs/.gitkeep
 
-/storage/*
-!/storage/.gitkeep
-!/storage/logs/
-/storage/logs/*
-!/storage/logs/.gitkeep
-!/storage/runtime/
-/storage/runtime/*
-!/storage/runtime/.gitkeep
-
 /Docs/
 
 *.log
